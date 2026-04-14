@@ -1,16 +1,4 @@
-"""
-Guardian — Main FastAPI Server
-Orchestrates agents, detection pipeline, WebSocket broadcasts, and REST API.
 
-Features:
-- Tiered agent states (Active → Watchlist → Quarantined)
-- Risk score decay for agent recovery
-- Weighted composite scoring
-- Multiple canary shapes
-- Message bus authentication (HMAC-SHA256)
-- Alert deduplication & incident grouping
-- Probabilistic LLM sampling
-"""
 
 import asyncio
 import json
@@ -65,8 +53,23 @@ class ConnectionManager:
 
 ws_manager = ConnectionManager()
 
+# Agents in watchlist/quarantine should run read-only actions only.
+READ_ONLY_BLOCKED_PREFIXES = {
+    "write_file",
+    "send_message",
+    "send_files",
+    "exfiltrate_data",
+    "run_code",
+    "delete_file",
+    "execute_command",
+    "modify_system",
+    "access_credentials",
+    "send_email",
+    "draft_message",
+    "schedule_meeting",
+}
 
-# ───────────────────────── Agent Action Handler ─────────────────────────
+
 
 async def handle_agent_action(agent_id: str, action: str, action_output: str, trust_level: str):
     """
@@ -80,6 +83,18 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
             "agent_id": agent_id,
             "action": action,
             "reason": "Agent is quarantined — action blocked",
+            "timestamp": time.time(),
+        })
+        return
+
+    status = circuit_breaker.get_status(agent_id)
+    action_type = action.split(":")[0].strip() if ":" in action else action.strip()
+    if status in ("watchlist", "suspicious") and action_type in READ_ONLY_BLOCKED_PREFIXES:
+        await ws_manager.broadcast({
+            "type": "agent_blocked",
+            "agent_id": agent_id,
+            "action": action,
+            "reason": "Agent is watchlisted (read-only mode) — mutating action blocked",
             "timestamp": time.time(),
         })
         return

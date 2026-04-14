@@ -1,19 +1,4 @@
-"""
-Circuit Breaker + Quarantine System + Rate Anomaly Detection
 
-Tiered agent states: ACTIVE → WATCHLIST → QUARANTINED
-  - ACTIVE: Normal operation (risk < 40)
-  - WATCHLIST: Elevated monitoring, highlighted on dashboard (40 ≤ risk < 70)
-  - QUARANTINED: Agent isolated, messages blocked (risk ≥ 70)
-
-Risk score decay: accumulated risk decays by 5% every clean evaluation
-cycle, allowing agents to recover from false positives and making the
-demo replayable without manual resets.
-
-Rate anomaly detection tracks action frequency per agent and
-flags abnormal spikes that may indicate a compromised agent
-attempting rapid data exfiltration.
-"""
 
 import threading
 import time
@@ -84,15 +69,7 @@ class CircuitBreaker:
             }
 
     def evaluate(self, agent_id: str, risk_score: float) -> dict:
-        """
-        Evaluate risk score and apply circuit breaker logic with tiered states.
-
-        Risk score decay: if the current action's risk is low (< 15), the
-        accumulated risk decays by RISK_DECAY_FACTOR. This allows agents
-        to recover from false positives over time.
-
-        Returns action taken.
-        """
+        
         # Record action for rate tracking
         self.record_action(agent_id)
 
@@ -107,16 +84,13 @@ class CircuitBreaker:
             prev_status = self._agent_status.get(agent_id, AgentStatus.ACTIVE)
             prev_accumulated = self._accumulated_risk.get(agent_id, 0.0)
 
-            # ── Risk Score Decay ──
-            # If this cycle's individual risk is low, decay accumulated risk
             if risk_score < 15:
                 decayed = prev_accumulated * RISK_DECAY_FACTOR
                 if decayed < RISK_DECAY_FLOOR:
                     decayed = 0.0
                 self._accumulated_risk[agent_id] = decayed
             else:
-                # Blend: take the max of accumulated risk and new score,
-                # but also let high scores push the accumulator up
+              
                 self._accumulated_risk[agent_id] = max(prev_accumulated * 0.7 + risk_score * 0.3, risk_score)
 
             effective_risk = self._accumulated_risk[agent_id]
@@ -209,7 +183,7 @@ class CircuitBreaker:
         self._on_watchlist_callbacks.append(callback)
 
     def can_send_message(self, agent_id: str) -> bool:
-        return not self.is_quarantined(agent_id)
+        return not self.is_quarantined(agent_id) and not self.is_watchlisted(agent_id)
 
 
 # Global singleton

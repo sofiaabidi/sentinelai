@@ -1,9 +1,4 @@
-"""
-Sentence-Transformer Embedding Engine
-Uses all-MiniLM-L6-v2 for action embedding and drift detection.
-Includes non-deterministic noise injection so drift scoring is
-never purely static — mirrors real-world sensor variance.
-"""
+
 
 import random
 import numpy as np
@@ -54,13 +49,7 @@ class EmbeddingEngine:
             })
 
     def compute_drift(self, agent_id: str, action: str) -> Dict:
-        """
-        Compute cosine drift from agent's historical centroid.
-        Returns drift_score (0-1) and metadata.
-
-        Includes stochastic noise on the threshold so detection is
-        never purely deterministic — matches real-world sensor behavior.
-        """
+       
         centroid = self._agent_centroids.get(agent_id)
         if centroid is None:
             return {"drift_score": 0.0, "explanation": "No baseline established",

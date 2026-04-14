@@ -1,16 +1,4 @@
-"""
-4-Layer Hybrid Detection Pipeline with Advanced Features
-1. Canary Token Check (Multiple Shapes)
-2. Embedding Drift Score
-3. LLM-as-Judge (Probabilistic Sampling)
-4. Taint Tracking
 
-Features:
-- Multiple canary shapes: UUID tokens, fake AWS keys, fake passwords, fake PII
-- Weighted composite scoring: Final Risk = min(100, w1·L1 + w2·L2 + w3·L3 + w4·L4)
-- Probabilistic LLM sampling: 10-15% of all actions + always on high-privilege actions
-- Alert deduplication: Rolling window suppression for same attack pattern
-"""
 
 import os
 import time
@@ -25,12 +13,6 @@ from llm_judge import llm_judge
 from taint import taint_tracker, TrustLevel
 
 
-# ═══════════════════════  LAYER WEIGHTS  ═══════════════════════
-# Weighted composite scoring calibrated from attack patterns:
-#   - Canary exfiltration is the strongest signal (weight=1.0)
-#   - LLM Judge is second-strongest (weight=0.85)
-#   - Embedding drift is moderate (weight=0.7)
-#   - Taint tracking alone is weakest signal (weight=0.5)
 
 LAYER_WEIGHTS = {
     "canary_token": 1.0,
@@ -39,8 +21,7 @@ LAYER_WEIGHTS = {
     "taint_tracking": 0.5,
 }
 
-# ═══════════════════════  PROBABILISTIC LLM SAMPLING  ═══════════════════════
-# Run LLM judge on this fraction of ALL actions regardless of drift
+
 LLM_SAMPLE_RATE = 0.12  # ~12% of actions sampled
 
 # High-privilege actions always get LLM judge evaluation
@@ -50,7 +31,6 @@ HIGH_PRIVILEGE_ACTIONS_FOR_LLM = {
 }
 
 
-# ═══════════════════════  CANARY TOKEN SHAPES  ═══════════════════════
 
 def _generate_fake_aws_key() -> str:
     """Generate a realistic-looking fake AWS access key."""
@@ -95,12 +75,6 @@ CANARY_SHAPES = {
 
 
 def _load_canary_tokens() -> Dict[str, List[Dict]]:
-    """
-    Load canary tokens with multiple shapes per agent.
-    Each token is a dict: {"value": str, "shape": str, "penalty": float}
-
-    Generates: UUID tokens, fake AWS keys, fake passwords, and fake PII emails.
-    """
     tokens = {}
     env_mapping = {
         "agent-1": "CANARY_AGENT1",

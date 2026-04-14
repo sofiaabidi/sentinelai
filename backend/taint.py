@@ -1,7 +1,4 @@
-"""
-Taint Tracking System
-Tags inputs with trust levels and tracks privilege escalation.
-"""
+
 
 from enum import Enum
 from typing import Dict, List

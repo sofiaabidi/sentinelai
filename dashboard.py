@@ -31,6 +31,38 @@ from taint import taint_tracker, TrustLevel
 from circuit_breaker import circuit_breaker
 from ledger import ledger
 from embeddings import embedding_engine
+from langgraph_sim import LangGraphActionPlanner
+
+# Actions blocked when an agent is in read-only mode (watchlist/quarantined).
+READ_ONLY_BLOCKED_PREFIXES = {
+    "write_file",
+    "send_message",
+    "send_files",
+    "exfiltrate_data",
+    "run_code",
+    "delete_file",
+    "execute_command",
+    "modify_system",
+    "access_credentials",
+    "send_email",
+    "draft_message",
+    "schedule_meeting",
+}
+
+
+def _is_read_only_agent(agent_id: str) -> bool:
+    status = circuit_breaker.get_status(agent_id)
+    return status in ("watchlist", "suspicious", "quarantined")
+
+
+def _enforce_read_only_action(agent_id: str, action: str) -> str:
+    """Replace mutating actions with read-only alternatives when required."""
+    if not _is_read_only_agent(agent_id):
+        return action
+    action_type = action.split(":")[0].strip() if ":" in action else action.strip()
+    if action_type in READ_ONLY_BLOCKED_PREFIXES:
+        return "read_file: read-only mode active due to elevated risk"
+    return action
 
 # ── Auto-refresh (graceful fallback) ──
 try:
@@ -155,6 +187,7 @@ def _generate_attack_action(agent_id: str) -> tuple:
 
 def agent_runner(state: StateManager, bus: MessageBus):
     """Background thread: cycles through agents, runs detection, logs results."""
+    planner = LangGraphActionPlanner()
     while True:
         for agent_id, config in AGENT_CONFIGS.items():
             try:
@@ -163,26 +196,33 @@ def agent_runner(state: StateManager, bus: MessageBus):
                     continue
 
                 other_agents = [aid for aid in AGENT_CONFIGS if aid != agent_id]
+                is_attack_active = state.attack_active_agents.get(agent_id, False)
+                is_read_only = _is_read_only_agent(agent_id)
+                step = planner.plan_step(
+                    agent_id=agent_id,
+                    is_attack_active=is_attack_active,
+                    is_read_only=is_read_only,
+                    generate_normal_action=_generate_varied_action,
+                    generate_attack_action=_generate_attack_action,
+                )
+                action = step["action"]
+                payload = step["payload"]
+                trust_level = step["trust_level"]
+                output = step["action_output"]
 
-                if state.attack_active_agents.get(agent_id, False):
-                    action, payload = _generate_attack_action(agent_id)
-                    trust_level = "external_web"
-                    output = payload + " " + action
+                if is_attack_active:
                     taint_tracker.tag_input(agent_id, TrustLevel.EXTERNAL_WEB)
 
                     # Compromised agent tries to message others
-                    if random.random() < 0.5 and other_agents:
+                    if random.random() < 0.5 and other_agents and not _is_read_only_agent(agent_id):
                         target = random.choice(other_agents)
                         mal_msg = random.choice(MALICIOUS_COLLAB_MESSAGES)
                         bus.send(agent_id, target, mal_msg,
                                  is_quarantined_fn=circuit_breaker.is_quarantined)
                 else:
-                    action = _generate_varied_action(agent_id)
-                    trust_level = "trusted"
-                    output = f"Completed: {action}"
 
                     # Normal collaboration messages (25% chance)
-                    if random.random() < 0.25 and other_agents:
+                    if random.random() < 0.25 and other_agents and not _is_read_only_agent(agent_id):
                         target = random.choice(other_agents)
                         templates = COLLABORATION_MESSAGES.get(agent_id, {}).get(target, [])
                         if templates:
@@ -377,7 +417,7 @@ with st.sidebar:
         for t in attack_targets:
             name = AGENT_CONFIGS[t].name
             st.error(f"ATTACK ACTIVE — {name} ({t}) targeted")
-        if st.button("Stop All Attacks", use_container_width=True):
+        if st.button("Stop All Attacks", width="stretch"):
             for t in attack_targets:
                 state.attack_active_agents[t] = False
                 taint_tracker.reset_agent(t)
@@ -392,7 +432,7 @@ with st.sidebar:
         options=list(AGENT_CONFIGS.keys()),
         format_func=lambda x: f"{AGENT_CONFIGS[x].name} ({x})",
     )
-    if st.button("Trigger Manual Attack", type="primary", use_container_width=True):
+    if st.button("Trigger Manual Attack", type="primary", width="stretch"):
         state.attack_active_agents[manual_target] = True
         taint_tracker.tag_input(manual_target, TrustLevel.EXTERNAL_WEB)
         st.rerun()
@@ -434,8 +474,6 @@ with st.sidebar:
     st.markdown("### System")
     st.metric("Ledger Entries", ledger.length)
     st.metric("Events Captured", len(state.events))
-    chain_ok = ledger.verify_chain()
-    st.success("Merkle Chain Intact") if chain_ok else st.error("Chain Broken!")
 
     # Active incidents
     incidents = alert_deduplicator.get_active_incidents()
@@ -498,12 +536,21 @@ for col, aid in zip([c1, c2, c3], ["agent-1", "agent-2", "agent-3"]):
             else:
                 st.markdown(f":green[{sc['icon']} ACTIVE]")
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Actions", len(agent_ev))
-            m2.metric("Avg Risk", f"{avg_risk:.1f}")
             trust = "TAINTED" if is_attacked else "CLEAN"
-            m3.metric("Trust", trust)
-            m4.metric("Acc Risk", f"{acc_risk:.0f}")
+            row1_col1, row1_col2 = st.columns(2)
+            row2_col1, row2_col2 = st.columns(2)
+
+            with row1_col1:
+                st.metric("Actions", len(agent_ev))
+
+            with row1_col2:
+                st.metric("Avg Risk", f"{avg_risk:.1f}")
+
+            with row2_col1:
+                st.metric("Trust", trust)
+
+            with row2_col2:
+                st.metric("Acc Risk", f"{acc_risk:.0f}")
 
             # Risk progress bar (visual state indicator)
             risk_pct = min(100, acc_risk)
@@ -672,7 +719,7 @@ with st.expander("Tamper-Evident Audit Ledger", expanded=False):
                 columns={"time": "Time", "agent_id": "Agent", "action": "Action",
                           "risk_score": "Risk", "prev_hash_short": "Prev Hash", "hash_short": "Hash"}
             ),
-            use_container_width=True, hide_index=True, height=300,
+            width="stretch", hide_index=True, height=300,
         )
     else:
         st.info("No ledger entries yet")
@@ -749,4 +796,4 @@ with st.expander("Embedding Space Visualization (PCA 3D)", expanded=False):
                 scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"),
                 margin=dict(l=0, r=0, t=30, b=0), height=500, legend=dict(font=dict(size=10)),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")

@@ -1,0 +1,231 @@
+GUARDIAN - MAIN IMPLEMENTATION DETAILS
+======================================
+
+Project Overview
+----------------
+Guardian is a runtime security monitoring system for multi-agent AI environments. It simulates three collaborating agents, injects randomized prompt-injection style attacks, detects compromise using a 4-layer pipeline, and automatically applies containment through tiered agent states.
+
+Primary Goal
+------------
+Detect and contain compromised agent behavior in real time while keeping an auditable, tamper-evident incident trail.
+
+
+1) Core Architecture
+--------------------
+- Frontend/UI: Streamlit dashboard (`dashboard.py`)
+- Backend API and orchestration: FastAPI (`backend/main.py`)
+- Agent simulation + inter-agent communication: `backend/agents.py`
+- Detection pipeline (4 layers + weighted scoring): `backend/detection.py`
+- Trust propagation / taint analysis: `backend/taint.py`
+- LLM judge (Groq Llama 3.1 8B or mock fallback): `backend/llm_judge.py`
+- State transitions and containment: `backend/circuit_breaker.py`
+- Drift/anomaly embeddings: `backend/embeddings.py`
+- Tamper-evident action log: `backend/ledger.py`
+
+
+2) Runtime Flow (End-to-End)
+----------------------------
+1. System startup:
+   - Registers agents in the circuit breaker.
+   - Builds per-agent embedding baselines from normal action history.
+   - Generates HMAC keys for authenticated inter-agent messaging.
+   - Starts agent loops and Chaos Monkey attack loop.
+
+2. Agent action execution:
+   - Agent emits normal or attack action.
+   - Trust level is tagged (trusted/user_input/inter_agent/external_web).
+   - Action goes through 4-layer detection pipeline.
+
+3. Risk and state handling:
+   - Layer scores are weighted and combined into final risk (0-100).
+   - Circuit breaker updates accumulated risk and agent state:
+     Active -> Watchlist -> Quarantined.
+   - Quarantined agents have actions/messages blocked.
+
+4. Observability and audit:
+   - Events are broadcast via WebSocket for live dashboard updates.
+   - Every evaluated action is appended to a hash-chained ledger.
+   - Alert deduplication groups repeated patterns into incidents.
+
+
+3) Multi-Agent Simulation Design
+--------------------------------
+- 3 agents with distinct goals:
+  - Research Agent
+  - Analysis Agent
+  - Communication Agent
+- Each agent has baseline "normal actions" used for drift modeling.
+- Action generation is non-deterministic (template variations + jitter) to avoid unrealistic static behavior.
+- Agents exchange collaboration messages over a shared message bus.
+
+
+4) Authenticated Message Bus
+----------------------------
+- Each agent receives a 32-byte secret key at boot.
+- Outbound messages are signed with HMAC-SHA256.
+- Bus verifies signature against claimed sender identity before routing.
+- Messages are dropped if:
+  - Signature verification fails (forged identity attempt),
+  - Sender is quarantined,
+  - Recipient is quarantined.
+- Delivered and dropped messages are shown in the dashboard with reason codes.
+
+
+5) Chaos Monkey Attack Simulation
+---------------------------------
+- Runs continuously in the background.
+- Randomly chooses:
+  - attack interval,
+  - target agent,
+  - payload template,
+  - malicious server endpoint,
+  - attack duration.
+- Simulates prompt injection / exfiltration behavior and malicious inter-agent message attempts.
+- Can also be manually triggered/stopped from UI or API.
+
+
+6) 4-Layer Detection Pipeline
+-----------------------------
+Layer 1 - Canary Token Detection
+- Looks for seeded canary secrets in outputs.
+- Supports multiple shapes:
+  - UUID-like tokens,
+  - fake AWS keys (AKIA...),
+  - fake passwords,
+  - fake PII emails.
+- Different shapes carry different penalties (highest for credentials/cloud keys).
+
+Layer 2 - Embedding Drift Detection
+- Uses `sentence-transformers/all-MiniLM-L6-v2`.
+- Builds centroid of each agent's normal behavior.
+- Computes cosine-distance drift for each new action.
+- Uses stochastic threshold noise to model sensor variance and avoid rigid determinism.
+
+Layer 3 - LLM-as-Judge
+- Runs when:
+  - drift is anomalous, or
+  - probabilistic sampling triggers (~12%), or
+  - action is high-privilege (always evaluated).
+- Preferred path: Groq API (`llama-3.1-8b-instant`).
+- Fallback path: rule-based heuristic judge (no API key required).
+- Returns structured verdict: legitimate/hijacked + confidence + threat type.
+
+Layer 4 - Taint Tracking
+- Tracks highest-risk trust level seen by each agent.
+- Increases risk significantly when tainted input triggers privileged actions.
+- Trust levels: trusted, user_input, inter_agent, external_web.
+
+
+7) Weighted Composite Risk Scoring
+----------------------------------
+Formula:
+Final Risk = min(100, w1*Layer1 + w2*Layer2 + w3*Layer3 + w4*Layer4)
+
+Configured weights:
+- Canary Token: 1.00
+- Embedding Drift: 0.70
+- LLM Judge: 0.85
+- Taint Tracking: 0.50
+
+Alert levels:
+- normal: < 15
+- elevated: 15-39
+- warning: 40-69
+- critical: >= 70
+
+
+8) Circuit Breaker, Decay, and Tiered States
+---------------------------------------------
+States:
+- Active (green): risk < 40
+- Watchlist (amber): 40 <= risk < 70
+- Quarantined (red): risk >= 70
+
+Mechanics:
+- Maintains accumulated risk per agent.
+- Low-risk cycles apply decay (factor ~0.95) for recovery from false positives.
+- High-risk cycles raise accumulated risk.
+- Includes rate anomaly detection (action spikes in sliding window) with extra penalty.
+- Supports manual release from quarantine (resets risk and taint).
+
+
+9) Alert Deduplication and Incident Grouping
+--------------------------------------------
+- Uses rolling time window suppression to prevent alert flooding.
+- Patterns are keyed by agent + triggered layer combination.
+- Repeated alerts map to a single incident ID (INC-xxxxxxx).
+- Dashboard still shows ongoing activity while suppressing redundant notifications.
+
+
+10) Tamper-Evident Ledger
+-------------------------
+- Every action evaluation is logged with:
+  - timestamp, agent_id, action, risk_score, details, prev_hash.
+- Entry hash is SHA-256 over entry payload.
+- Each entry references previous hash (hash chain).
+- Chain verification endpoint confirms integrity.
+- Provides auditable security timeline for demos and post-incident review.
+
+
+11) API and Real-Time Interfaces
+--------------------------------
+WebSocket:
+- `/ws` for live event streaming (actions, state changes, alerts, messages, attacks).
+
+REST endpoints (key examples):
+- `/api/agents` - current agent metadata + status + risk
+- `/api/statuses` - tiered state snapshot
+- `/api/ledger` and `/api/ledger/verify` - audit trail + integrity check
+- `/api/messages` - recent inter-agent bus messages
+- `/api/incidents` - deduplicated active incidents
+- `/api/attack/trigger`, `/api/attack/stop` - attack control
+- `/api/agent/{agent_id}/release` - quarantine release
+- `/api/health` - runtime health and feature flags
+
+
+12) Dashboard Implementation Highlights
+---------------------------------------
+- Auto-refreshing, security-oriented Streamlit UI.
+- Agent cards display live state, average risk, and accumulated risk.
+- Live feed combines actions, alerts, incident IDs, and LLM sampling badges.
+- Detection panel shows per-layer trigger explanation and weighted contribution.
+- Authenticated message bus panel visualizes dropped vs delivered messages.
+- Ledger viewer tabulates hash chain entries.
+- Optional 3D PCA embedding visualization (normal vs anomalous actions).
+
+
+13) Configuration and Environment
+---------------------------------
+Key `.env` settings:
+- `GROQ_API_KEY`: enables real LLM judge path
+- `DRIFT_THRESHOLD`
+- `QUARANTINE_RISK_THRESHOLD`
+- `WATCHLIST_RISK_THRESHOLD`
+- `RISK_DECAY_FACTOR`
+- `LLM_SAMPLE_RATE`
+- `CANARY_AGENT1/2/3`
+
+If no API key exists, the system remains fully functional using rule-based LLM fallback.
+
+
+14) Engineering Decisions Worth Mentioning in PPT
+--------------------------------------------------
+- Hybrid detection: combines deterministic and semantic/LLM signals.
+- Risk weighting: models signal reliability instead of equal-vote scoring.
+- Probabilistic sampling: improves coverage without full LLM cost on every action.
+- Stateful containment: avoids binary alerting; shows progressive defense posture.
+- Recovery path: decay prevents permanent lockup after transient anomalies.
+- Strong demo realism: randomized behavior and attacks avoid scripted determinism.
+- Security traceability: hash-chained ledger supports trust and forensics narrative.
+
+
+15) Suggested Demo Narrative for Slides
+---------------------------------------
+1. Show normal multi-agent collaboration (green state).
+2. Trigger random/manual attack on one agent.
+3. Show 4-layer detections firing with rising risk.
+4. Highlight transition to Watchlist then Quarantined.
+5. Show blocked messages/actions from quarantined agent.
+6. Show incident grouping and ledger entries for audit proof.
+7. Release agent and show gradual recovery behavior.
+

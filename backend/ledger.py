@@ -1,7 +1,4 @@
-"""
-Tamper-Evident Merkle-Chained Ledger
-Every action is logged as a chained entry where hash covers all fields including prev_hash.
-"""
+
 
 import hashlib
 import json

@@ -1,11 +1,4 @@
-"""
-LLM-as-Judge Module
-Uses Groq API with Llama 3.1 8B Instant for structured verdict on suspicious actions.
-Falls back to a rule-based mock if no API key is available.
 
-Provides both synchronous (for Streamlit dashboard thread) and asynchronous
-(for FastAPI event loop) interfaces to prevent blocking.
-"""
 
 import asyncio
 import os
