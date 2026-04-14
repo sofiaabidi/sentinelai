@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # Load .env from the backend directory
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_backend_dir, ".env"))
+load_dotenv(os.path.join(_backend_dir, ".env"), override=False)
 
 from agents import agent_simulator, message_bus, chaos_monkey, AGENT_CONFIGS, agent_key_store
 from detection import run_detection_pipeline, alert_deduplicator, LAYER_WEIGHTS, CANARY_SHAPES

@@ -21,7 +21,26 @@ _root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_root, "backend"))
 
 from dotenv import load_dotenv
-load_dotenv(os.path.join(_root, "backend", ".env"))
+
+# Cloud-first secrets loading:
+# 1) Runtime/platform env vars (or Streamlit secrets mapped below)
+# 2) Local .env fallback for development
+_local_env_path = os.path.join(_root, "backend", ".env")
+load_dotenv(_local_env_path, override=False)
+
+for _key in (
+    "GROQ_API_KEY",
+    "DRIFT_THRESHOLD",
+    "QUARANTINE_RISK_THRESHOLD",
+    "WATCHLIST_RISK_THRESHOLD",
+    "RISK_DECAY_FACTOR",
+    "LLM_SAMPLE_RATE",
+    "CANARY_AGENT1",
+    "CANARY_AGENT2",
+    "CANARY_AGENT3",
+):
+    if _key not in os.environ and _key in st.secrets:
+        os.environ[_key] = str(st.secrets[_key])
 
 from agents import AGENT_CONFIGS, ATTACK_ACTION_TEMPLATES, ATTACK_PAYLOAD_TEMPLATES
 from agents import MALICIOUS_SERVERS, MALICIOUS_COLLAB_MESSAGES, COLLABORATION_MESSAGES
