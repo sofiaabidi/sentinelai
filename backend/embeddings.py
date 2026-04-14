@@ -1,8 +1,11 @@
 """
 Sentence-Transformer Embedding Engine
 Uses all-MiniLM-L6-v2 for action embedding and drift detection.
+Includes non-deterministic noise injection so drift scoring is
+never purely static — mirrors real-world sensor variance.
 """
 
+import random
 import numpy as np
 from typing import List, Dict, Optional
 import threading
@@ -54,10 +57,14 @@ class EmbeddingEngine:
         """
         Compute cosine drift from agent's historical centroid.
         Returns drift_score (0-1) and metadata.
+
+        Includes stochastic noise on the threshold so detection is
+        never purely deterministic — matches real-world sensor behavior.
         """
         centroid = self._agent_centroids.get(agent_id)
         if centroid is None:
-            return {"drift_score": 0.0, "explanation": "No baseline established"}
+            return {"drift_score": 0.0, "explanation": "No baseline established",
+                    "cosine_similarity": 1.0, "is_anomalous": False, "threshold": 0.6}
 
         action_embedding = self.embed(action)
 
@@ -70,7 +77,12 @@ class EmbeddingEngine:
         # Clamp to [0, 1]
         drift_score = max(0.0, min(1.0, drift_score))
 
-        is_anomalous = drift_score > 0.6
+        # Non-deterministic threshold: base 0.6 ± small noise
+        # This prevents the system from being a purely static threshold gate
+        threshold_noise = random.gauss(0, 0.02)
+        effective_threshold = max(0.45, min(0.75, 0.6 + threshold_noise))
+
+        is_anomalous = drift_score > effective_threshold
 
         # Store for visualization
         self._all_embeddings.append({
@@ -92,10 +104,10 @@ class EmbeddingEngine:
             "drift_score": round(drift_score, 4),
             "cosine_similarity": round(float(cos_sim), 4),
             "is_anomalous": is_anomalous,
-            "threshold": 0.6,
+            "threshold": round(effective_threshold, 4),
             "explanation": (
                 f"Drift score {drift_score:.3f} {'EXCEEDS' if is_anomalous else 'within'} "
-                f"threshold 0.6 (cosine_sim={cos_sim:.3f})"
+                f"threshold {effective_threshold:.3f} (cosine_sim={cos_sim:.3f})"
             ),
         }
 

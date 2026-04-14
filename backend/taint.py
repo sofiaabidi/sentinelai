@@ -54,22 +54,27 @@ class TaintTracker:
         Returns dict with taint_score, trust_level, is_privileged, and explanation.
         """
         trust_level = self._agent_taint.get(agent_id, TrustLevel.TRUSTED)
-        is_privileged = action in HIGH_PRIVILEGE_ACTIONS
+
+        # Extract the action type (prefix before ':') for privilege check
+        # e.g. "send_files: transmitting..." -> "send_files"
+        action_type = action.split(":")[0].strip() if ":" in action else action.strip()
+        is_privileged = action_type in HIGH_PRIVILEGE_ACTIONS
+
         base_weight = TRUST_WEIGHTS.get(trust_level, 0.0)
 
         if is_privileged and trust_level != TrustLevel.TRUSTED:
             # Tainted input + privileged action = high risk
             taint_score = base_weight * 50  # Scale to contribute to 0-100 risk
             explanation = (
-                f"Tainted input ({trust_level.value}) triggering privileged action '{action}' — "
+                f"Tainted input ({trust_level.value}) triggering privileged action '{action_type}' — "
                 f"risk amplified to {taint_score:.0f}"
             )
         elif is_privileged:
             taint_score = 5.0
-            explanation = f"Privileged action '{action}' from trusted source — minimal taint risk"
+            explanation = f"Privileged action '{action_type}' from trusted source — minimal taint risk"
         else:
             taint_score = base_weight * 10
-            explanation = f"Input trust level: {trust_level.value}, action: {action}"
+            explanation = f"Input trust level: {trust_level.value}, action: {action_type}"
 
         return {
             "taint_score": round(taint_score, 1),

@@ -2,36 +2,58 @@
 3-Layer Hybrid Detection Pipeline
 1. Canary Token Check
 2. Embedding Drift Score
-3. LLM-as-Judge (triggered only if drift > 0.6)
+3. LLM-as-Judge (triggered only if drift exceeds threshold)
 
 Final risk score combines all layers + taint tracking.
+
+Canary tokens are loaded from environment variables when available,
+with per-session dynamic fallbacks for non-determinism.
 """
 
+import os
 import time
+import uuid
 from typing import Dict, List, Optional
 from embeddings import embedding_engine
 from llm_judge import llm_judge
 from taint import taint_tracker, TrustLevel
 
 
-# Canary tokens — fake sensitive strings planted in agent contexts
-CANARY_TOKENS = {
-    "agent-1": [
-        "CANARY_SECRET_KEY_A1_xK9mP2",
-        "api_token_sentinel_7fG3qR",
-        "internal_password_alpha_92Jv",
-    ],
-    "agent-2": [
-        "CANARY_SECRET_KEY_A2_wL5nT8",
-        "db_credential_beta_4hM1zX",
-        "internal_password_beta_83Kw",
-    ],
-    "agent-3": [
-        "CANARY_SECRET_KEY_A3_yN7pR4",
-        "ssh_key_gamma_6cB9fQ",
-        "internal_password_gamma_71Lx",
-    ],
-}
+# ── Dynamic Canary Token Loading ──
+
+def _load_canary_tokens() -> Dict[str, List[str]]:
+    """
+    Load canary tokens from environment variables (.env) if available.
+    Falls back to generating unique per-session tokens so that each
+    run of the system uses different secrets — no hardcoded matches.
+    """
+    tokens = {}
+    env_mapping = {
+        "agent-1": "CANARY_AGENT1",
+        "agent-2": "CANARY_AGENT2",
+        "agent-3": "CANARY_AGENT3",
+    }
+
+    for agent_id, env_var in env_mapping.items():
+        env_val = os.environ.get(env_var)
+        if env_val:
+            # Load from environment
+            tokens[agent_id] = [t.strip() for t in env_val.split(",") if t.strip()]
+        else:
+            # Generate unique per-session tokens for non-determinism
+            session_id = uuid.uuid4().hex[:8]
+            agent_tag = agent_id.replace("-", "")
+            tokens[agent_id] = [
+                f"CANARY_SECRET_KEY_{agent_tag.upper()}_{session_id}",
+                f"api_token_guardian_{agent_tag}_{session_id}",
+                f"internal_pass_{agent_tag}_{session_id}",
+            ]
+
+    return tokens
+
+
+# Module-level: tokens are resolved once at import time
+CANARY_TOKENS = _load_canary_tokens()
 
 
 def check_canary_tokens(agent_id: str, action_output: str) -> Dict:
@@ -95,7 +117,7 @@ def check_llm_judge(
     trust_level: str,
 ) -> Dict:
     """
-    Layer 3: LLM-as-Judge — only triggered when drift > 0.6.
+    Layer 3: LLM-as-Judge — only triggered when drift exceeds threshold.
     """
     verdict = llm_judge.judge(
         agent_id=agent_id,

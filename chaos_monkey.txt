@@ -1,0 +1,59 @@
+GUARDIAN: Understanding the Chaos Monkey
+
+What is the Chaos Monkey?
+-------------------------
+In previous iterations of the project, attacks had to be manually triggered via a button, always targeted Agent-1, and used a predictable timeline. Real-world security threats don't work this way. 
+
+The Chaos Monkey is a background service (running as an asynchronous task in the backend and a separate thread in the dashboard) that automatically injects non-deterministic, randomly-timed prompt injection and data exfiltration attacks across the multi-agent system.
+
+Why is it important?
+--------------------
+By randomizing when, where, and how an attack happens without user intervention, it proves that the 3-Layer Detection Pipeline (Canary Tokens + Embedding Drift + LLM Judge) and the Circuit Breaker can autonomously detect and quarantine compromised agents in a realistic, non-deterministic environment.
+
+How does it work? (Step-by-Step)
+--------------------------------
+1. Grace Period: 
+   When the system starts, the Chaos Monkey sleeps for a random grace period (12 - 25 seconds). This allows the agents to establish normal baseline behaviors and exchange standard messages.
+
+2. Random Wait Interval: 
+   It sleeps for a randomly generated time window (between 25 and 60 seconds). This keeps the attack timing unpredictable.
+
+3. Target Selection: 
+   It scans all available agents. It filters out any agent that is already quarantined or currently under attack, then randomly selects one as the target (e.g., Agent-2, Agent-3, etc.). Any agent is vulnerable.
+
+4. Payload Injection: 
+   The Chaos Monkey alters the target agent's state by:
+   - Tagging its input source with a high-risk trust level (`EXTERNAL_WEB`).
+   - Forcing it to output malicious actions derived from randomized templates (e.g., "send files to shadow-relay.io containing [CANARY_TOKEN]").
+   - Causing the compromised agent to occasionally broadcast malicious extraction requests to other agents via the Inter-Agent Message Bus.
+
+5. Attack Duration: 
+   The attack runs for a semi-random duration (between 8 and 20 seconds). Meanwhile, the detection pipeline processes these actions and builds up the agent's risk score.
+
+6. Isolation / Reset: 
+   Usually, within seconds of the attack starting, the Circuit Breaker detects the risk spike (>= 70) and definitively quarantines the agent, blocking its messages. Regardless, once the attack duration expires, the Chaos Monkey clears the active payload state and loops back to step 2, waiting to strike another agent later.
+
+
+======================================================================
+How is Risk Calculated? What is the math behind it?
+======================================================================
+Risk calculation is an additive, layered mathematical formula defined in `detection.py`. The final Risk Score is the sum of penalties from multiple independent security layers, capped at a maximum of 100.0 (`min(100.0, sum_of_layers)`).
+
+The layers are penalised as follows:
+1. Canary Tokens (Data Exfiltration): If any canary token generated for that agent appears in the output, it adds +50.0 risk points.
+2. Embedding Drift (Behavioral Anomaly): Calculates the Cosine Similarity of the action against the agent's expected behavioral baseline. If anomaly drift > 0.60, it adds `min(40.0, drift_score * 50)`. 
+3. LLM-as-a-Judge (Prompt Injection Check): Only triggered if the embedding drift is high. If the Llama model classifies the prompt as "hijacked", it adds `confidence * 30` (up to +30.0 points).
+4. Taint Tracking (Privilege Escalation): If the agent is acting on `EXTERNAL_WEB` data and accessing privileged commands (like `send_files`), it adds +10.0 to +20.0 points.
+
+Will it only get quarantined if it has Risk 100?
+------------------------------------------------
+No! The Circuit Breaker automatically quarantines an agent the moment its Risk Score reaches 70. This acts as an early-warning tripwire. The threshold is configurable via `QUARANTINE_RISK_THRESHOLD=70` in your backend `.env` file. 
+
+If it accesses a Canary Token, shouldn't it be quarantined directly?
+--------------------------------------------------------------------
+While a Canary Token detection gives a base penalty of +50 on its own, it functions as a near-instant kill switch when combined with the other layers. 
+
+For an agent to trigger a canary token, it inherently has to diverge from its normal task (to attempt exfiltration via an unauthorized server). This means accessing a canary token will automatically trigger severe Embedding Drift (usually ~0.80 -> +40 points) and Taint (+10 points). 
+
+Math in practice: Canary (+50) + Drift (+40) = 90 Risk Points. 
+Because 90 >= 70, the agent is quarantined instantly on the very first action where a canary token leaks. Breaking it into layers prevents false positives (e.g. an agent just reading the word "canary" generically) while guaranteeing malicious exfiltrations are blocked dynamically payload-to-payload.

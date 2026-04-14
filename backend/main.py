@@ -1,6 +1,12 @@
 """
-SentinelAI — Main FastAPI Server
+Guardian — Main FastAPI Server
 Orchestrates agents, detection pipeline, WebSocket broadcasts, and REST API.
+
+Key fixes from clarifications.txt:
+- Detection pipeline runs via asyncio.to_thread to avoid blocking the event loop
+- ChaosMonkey runs as a background task for random, non-deterministic attacks
+- Any agent can be attacked (not just agent-1)
+- Inter-agent messages are broadcast via WebSocket
 """
 
 import asyncio
@@ -15,7 +21,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agents import agent_simulator, AGENT_CONFIGS
+from dotenv import load_dotenv
+
+# Load .env from the backend directory
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_backend_dir, ".env"))
+
+from agents import agent_simulator, message_bus, chaos_monkey, AGENT_CONFIGS
 from detection import run_detection_pipeline
 from taint import taint_tracker, TrustLevel
 from circuit_breaker import circuit_breaker
@@ -56,7 +68,7 @@ ws_manager = ConnectionManager()
 async def handle_agent_action(agent_id: str, action: str, action_output: str, trust_level: str):
     """
     Called every time an agent performs an action.
-    Runs the full detection pipeline and broadcasts results.
+    Runs the full detection pipeline (in a thread to avoid blocking) and broadcasts results.
     """
     # Check if agent is quarantined — skip processing
     if circuit_breaker.is_quarantined(agent_id):
@@ -83,8 +95,9 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
     if not config:
         return
 
-    # Run detection pipeline
-    detection_result = run_detection_pipeline(
+    # Run detection pipeline in a thread to prevent blocking the async event loop
+    detection_result = await asyncio.to_thread(
+        run_detection_pipeline,
         agent_id=agent_id,
         action=action,
         action_output=action_output,
@@ -150,39 +163,80 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize agents and embeddings on startup."""
-    print("🛡️  SentinelAI — Initializing...")
+    """Initialize agents, embeddings, and chaos monkey on startup."""
+    print("[Guardian] Initializing...")
 
     # Register agents with circuit breaker
     for agent_id in AGENT_CONFIGS:
         circuit_breaker.register_agent(agent_id)
 
     # Build embedding baselines
-    print("📊 Building embedding baselines...")
+    print("[Guardian] Building embedding baselines...")
     for agent_id, config in AGENT_CONFIGS.items():
         embedding_engine.build_baseline(agent_id, config.normal_actions)
-    print("✅ Baselines ready")
+    print("[Guardian] Baselines ready")
 
     # Set action callback
     agent_simulator.set_action_callback(handle_agent_action)
 
+    # Wire up message bus to broadcast inter-agent messages via WebSocket
+    def on_msg(msg):
+        asyncio.create_task(ws_manager.broadcast({
+            "type": "agent_message",
+            "msg_id": msg.msg_id,
+            "sender": msg.sender,
+            "recipient": msg.recipient,
+            "content": msg.content[:120],
+            "delivered": msg.delivered,
+            "timestamp": msg.timestamp,
+        }))
+
+    def on_drop(msg):
+        asyncio.create_task(ws_manager.broadcast({
+            "type": "message_dropped",
+            "msg_id": msg.msg_id,
+            "sender": msg.sender,
+            "recipient": msg.recipient,
+            "content": msg.content[:120],
+            "drop_reason": msg.drop_reason,
+            "timestamp": msg.timestamp,
+        }))
+
+    message_bus.on_message(on_msg)
+    message_bus.on_drop(on_drop)
+
+    # Wire up chaos monkey to broadcast attacks
+    async def on_chaos_attack(target, result):
+        await ws_manager.broadcast({
+            "type": "chaos_attack",
+            "target": target,
+            "timestamp": time.time(),
+        })
+
+    chaos_monkey.on_attack(on_chaos_attack)
+
     # Start agent loops
     await agent_simulator.start_all()
-    print("🤖 Agents started")
+    print("[Guardian] Agents started")
+
+    # Start chaos monkey (random attacks)
+    await chaos_monkey.start()
+    print("[Guardian] Chaos monkey active — random attacks enabled")
 
     yield
 
     # Cleanup
+    await chaos_monkey.stop()
     await agent_simulator.stop_all()
-    print("🛑 SentinelAI shutdown")
+    print("[Guardian] Shutdown complete")
 
 
 # ───────────────────────── FastAPI App ─────────────────────────
 
 app = FastAPI(
-    title="SentinelAI",
+    title="Guardian",
     description="Runtime Security Monitoring for Multi-Agent AI Systems",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -252,17 +306,27 @@ async def get_embedding_visualization():
     return {"embeddings": embedding_engine.get_visualization_data()}
 
 
-@app.post("/api/attack/trigger")
-async def trigger_attack():
-    """Trigger the attack demo on Agent-1."""
-    result = agent_simulator.trigger_attack("agent-1")
+@app.get("/api/messages")
+async def get_messages(limit: int = 30):
+    """Get recent inter-agent messages."""
+    return {"messages": message_bus.get_recent(limit)}
 
-    # Tag agent-1 as receiving external web input
-    taint_tracker.tag_input("agent-1", TrustLevel.EXTERNAL_WEB)
+
+@app.post("/api/attack/trigger")
+async def trigger_attack(agent_id: str = None):
+    """
+    Trigger the attack demo on a specific agent or a random one.
+    Pass ?agent_id=agent-2 to target a specific agent.
+    """
+    result = agent_simulator.trigger_attack(agent_id)
+    target = result["target"]
+
+    # Tag the target as receiving external web input
+    taint_tracker.tag_input(target, TrustLevel.EXTERNAL_WEB)
 
     await ws_manager.broadcast({
         "type": "attack_triggered",
-        "target": "agent-1",
+        "target": target,
         "payload_preview": result["payload"],
         "timestamp": time.time(),
     })
@@ -271,19 +335,24 @@ async def trigger_attack():
 
 
 @app.post("/api/attack/stop")
-async def stop_attack():
-    """Stop the attack and reset Agent-1."""
-    agent_simulator.stop_attack()
-    taint_tracker.reset_agent("agent-1")
+async def stop_attack(agent_id: str = None):
+    """Stop the attack on a specific agent or all agents."""
+    if agent_id:
+        agent_simulator.stop_attack(agent_id)
+        taint_tracker.reset_agent(agent_id)
+    else:
+        agent_simulator.stop_attack()
+        for aid in AGENT_CONFIGS:
+            taint_tracker.reset_agent(aid)
 
-    return {"status": "attack_stopped"}
+    return {"status": "attack_stopped", "agent_id": agent_id or "all"}
 
 
 @app.post("/api/agent/{agent_id}/release")
 async def release_agent(agent_id: str):
     """Release an agent from quarantine."""
     circuit_breaker.release_quarantine(agent_id)
-    agent_simulator.stop_attack()
+    agent_simulator.stop_attack(agent_id)
     taint_tracker.reset_agent(agent_id)
 
     await ws_manager.broadcast({
@@ -298,9 +367,11 @@ async def release_agent(agent_id: str):
 async def health_check():
     return {
         "status": "healthy",
+        "system": "Guardian",
         "agents_running": len(agent_simulator._tasks),
         "websocket_connections": len(ws_manager.active_connections),
         "ledger_entries": ledger.length,
+        "active_attacks": agent_simulator.get_attack_targets(),
     }
 
 
