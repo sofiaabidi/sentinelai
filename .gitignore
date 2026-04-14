@@ -1,0 +1,81 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.env/
+.env.*
+.venv/
+
+# =========================
+# Environment & Secrets
+# =========================
+.env
+.env.local
+.env.*.local
+*.env
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OpenCV / Images / Data
+# =========================
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.mp4
+*.avi
+
+# (optional) keep sample assets folder tracked
+# !assets/
+# !assets/*.png
+
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Cache
+# =========================
+.cache/
+.pytest_cache/
+
+# =========================
+# Misc
+# =========================
+*.bak
+*.tmp
+*.temp
