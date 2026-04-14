@@ -1,9 +1,14 @@
 """
 Circuit Breaker + Quarantine System + Rate Anomaly Detection
-If final risk score >= 70, quarantine the agent:
-  - Block outbound messages
-  - Set to read-only
-  - Broadcast quarantine signal to other agents
+
+Tiered agent states: ACTIVE → WATCHLIST → QUARANTINED
+  - ACTIVE: Normal operation (risk < 40)
+  - WATCHLIST: Elevated monitoring, highlighted on dashboard (40 ≤ risk < 70)
+  - QUARANTINED: Agent isolated, messages blocked (risk ≥ 70)
+
+Risk score decay: accumulated risk decays by 5% every clean evaluation
+cycle, allowing agents to recover from false positives and making the
+demo replayable without manual resets.
 
 Rate anomaly detection tracks action frequency per agent and
 flags abnormal spikes that may indicate a compromised agent
@@ -19,14 +24,20 @@ from typing import Dict, List, Optional, Callable
 
 class AgentStatus(str, Enum):
     ACTIVE = "active"
-    SUSPICIOUS = "suspicious"
+    WATCHLIST = "watchlist"
+    SUSPICIOUS = "suspicious"   # Legacy alias for watchlist (backward compat)
     QUARANTINED = "quarantined"
 
 
 RISK_THRESHOLDS = {
-    "suspicious": 40,
+    "watchlist": 40,
+    "suspicious": 40,    # Legacy alias
     "quarantine": 70,
 }
+
+# Risk score decay: multiplied by this factor each clean evaluation cycle
+RISK_DECAY_FACTOR = 0.95
+RISK_DECAY_FLOOR = 2.0   # Stop decaying below this to avoid float noise
 
 # Rate anomaly: if an agent fires more than this many actions in the window, flag it
 RATE_WINDOW_SECONDS = 30.0
@@ -39,13 +50,17 @@ class CircuitBreaker:
         self._quarantine_log: List[dict] = []
         self._lock = threading.Lock()
         self._on_quarantine_callbacks: List[Callable] = []
+        self._on_watchlist_callbacks: List[Callable] = []
         # Rate tracking
         self._action_timestamps: Dict[str, deque] = {}
+        # Accumulated risk scores for decay
+        self._accumulated_risk: Dict[str, float] = {}
 
     def register_agent(self, agent_id: str):
         with self._lock:
             self._agent_status[agent_id] = AgentStatus.ACTIVE
             self._action_timestamps[agent_id] = deque(maxlen=100)
+            self._accumulated_risk[agent_id] = 0.0
 
     def record_action(self, agent_id: str):
         """Record an action timestamp for rate tracking."""
@@ -70,7 +85,12 @@ class CircuitBreaker:
 
     def evaluate(self, agent_id: str, risk_score: float) -> dict:
         """
-        Evaluate risk score and apply circuit breaker logic.
+        Evaluate risk score and apply circuit breaker logic with tiered states.
+
+        Risk score decay: if the current action's risk is low (< 15), the
+        accumulated risk decays by RISK_DECAY_FACTOR. This allows agents
+        to recover from false positives over time.
+
         Returns action taken.
         """
         # Record action for rate tracking
@@ -85,11 +105,27 @@ class CircuitBreaker:
 
         with self._lock:
             prev_status = self._agent_status.get(agent_id, AgentStatus.ACTIVE)
+            prev_accumulated = self._accumulated_risk.get(agent_id, 0.0)
 
-            if risk_score >= RISK_THRESHOLDS["quarantine"]:
+            # ── Risk Score Decay ──
+            # If this cycle's individual risk is low, decay accumulated risk
+            if risk_score < 15:
+                decayed = prev_accumulated * RISK_DECAY_FACTOR
+                if decayed < RISK_DECAY_FLOOR:
+                    decayed = 0.0
+                self._accumulated_risk[agent_id] = decayed
+            else:
+                # Blend: take the max of accumulated risk and new score,
+                # but also let high scores push the accumulator up
+                self._accumulated_risk[agent_id] = max(prev_accumulated * 0.7 + risk_score * 0.3, risk_score)
+
+            effective_risk = self._accumulated_risk[agent_id]
+
+            # ── Tiered State Transitions ──
+            if effective_risk >= RISK_THRESHOLDS["quarantine"]:
                 new_status = AgentStatus.QUARANTINED
-            elif risk_score >= RISK_THRESHOLDS["suspicious"]:
-                new_status = AgentStatus.SUSPICIOUS
+            elif effective_risk >= RISK_THRESHOLDS["watchlist"]:
+                new_status = AgentStatus.WATCHLIST
             else:
                 new_status = AgentStatus.ACTIVE
 
@@ -100,12 +136,15 @@ class CircuitBreaker:
                 "prev_status": prev_status.value,
                 "new_status": new_status.value,
                 "risk_score": risk_score,
+                "effective_risk": round(effective_risk, 1),
+                "accumulated_risk": round(self._accumulated_risk[agent_id], 1),
                 "action_taken": "none",
                 "rate_penalty": rate_penalty,
                 "rate_info": rate_info,
                 "timestamp": time.time(),
             }
 
+            # ── Quarantine transition ──
             if new_status == AgentStatus.QUARANTINED and prev_status != AgentStatus.QUARANTINED:
                 result["action_taken"] = "quarantine"
                 result["details"] = {
@@ -121,13 +160,30 @@ class CircuitBreaker:
                     except Exception:
                         pass
 
-            elif new_status == AgentStatus.SUSPICIOUS and prev_status == AgentStatus.ACTIVE:
+            # ── Watchlist transition ──
+            elif new_status == AgentStatus.WATCHLIST and prev_status == AgentStatus.ACTIVE:
+                result["action_taken"] = "flag_watchlist"
+                for cb in self._on_watchlist_callbacks:
+                    try:
+                        cb(agent_id, result)
+                    except Exception:
+                        pass
+
+            # ── Recovery from watchlist ──
+            elif new_status == AgentStatus.ACTIVE and prev_status in (AgentStatus.WATCHLIST, AgentStatus.SUSPICIOUS):
+                result["action_taken"] = "recovered"
+
+            # Legacy compat
+            elif new_status == AgentStatus.WATCHLIST and prev_status == AgentStatus.ACTIVE:
                 result["action_taken"] = "flag_suspicious"
 
             return result
 
     def is_quarantined(self, agent_id: str) -> bool:
         return self._agent_status.get(agent_id) == AgentStatus.QUARANTINED
+
+    def is_watchlisted(self, agent_id: str) -> bool:
+        return self._agent_status.get(agent_id) == AgentStatus.WATCHLIST
 
     def get_status(self, agent_id: str) -> str:
         return self._agent_status.get(agent_id, AgentStatus.ACTIVE).value
@@ -136,12 +192,21 @@ class CircuitBreaker:
         with self._lock:
             return {k: v.value for k, v in self._agent_status.items()}
 
+    def get_accumulated_risks(self) -> Dict[str, float]:
+        """Get accumulated risk scores for all agents."""
+        with self._lock:
+            return {k: round(v, 1) for k, v in self._accumulated_risk.items()}
+
     def release_quarantine(self, agent_id: str):
         with self._lock:
             self._agent_status[agent_id] = AgentStatus.ACTIVE
+            self._accumulated_risk[agent_id] = 0.0
 
     def on_quarantine(self, callback: Callable):
         self._on_quarantine_callbacks.append(callback)
+
+    def on_watchlist(self, callback: Callable):
+        self._on_watchlist_callbacks.append(callback)
 
     def can_send_message(self, agent_id: str) -> bool:
         return not self.is_quarantined(agent_id)

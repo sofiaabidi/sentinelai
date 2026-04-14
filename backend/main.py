@@ -2,11 +2,14 @@
 Guardian — Main FastAPI Server
 Orchestrates agents, detection pipeline, WebSocket broadcasts, and REST API.
 
-Key fixes from clarifications.txt:
-- Detection pipeline runs via asyncio.to_thread to avoid blocking the event loop
-- ChaosMonkey runs as a background task for random, non-deterministic attacks
-- Any agent can be attacked (not just agent-1)
-- Inter-agent messages are broadcast via WebSocket
+Features:
+- Tiered agent states (Active → Watchlist → Quarantined)
+- Risk score decay for agent recovery
+- Weighted composite scoring
+- Multiple canary shapes
+- Message bus authentication (HMAC-SHA256)
+- Alert deduplication & incident grouping
+- Probabilistic LLM sampling
 """
 
 import asyncio
@@ -27,8 +30,8 @@ from dotenv import load_dotenv
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_backend_dir, ".env"))
 
-from agents import agent_simulator, message_bus, chaos_monkey, AGENT_CONFIGS
-from detection import run_detection_pipeline
+from agents import agent_simulator, message_bus, chaos_monkey, AGENT_CONFIGS, agent_key_store
+from detection import run_detection_pipeline, alert_deduplicator, LAYER_WEIGHTS, CANARY_SHAPES
 from taint import taint_tracker, TrustLevel
 from circuit_breaker import circuit_breaker
 from ledger import ledger
@@ -106,7 +109,7 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
         trust_level=trust_level,
     )
 
-    # Apply circuit breaker
+    # Apply circuit breaker (with tiered states and risk decay)
     cb_result = circuit_breaker.evaluate(agent_id, detection_result["final_risk_score"])
 
     # Log to ledger
@@ -119,10 +122,13 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
             "layers_triggered": [l["layer"] for l in detection_result["layers"] if l.get("triggered")],
             "trust_level": trust_level,
             "circuit_breaker": cb_result["action_taken"],
+            "agent_state": cb_result["new_status"],
+            "incident_id": detection_result.get("incident_id"),
+            "accumulated_risk": cb_result.get("accumulated_risk", 0),
         },
     )
 
-    # Broadcast action event
+    # Broadcast action event (only if alert dedup allows, or always for action feed)
     await ws_manager.broadcast({
         "type": "agent_action",
         "agent_id": agent_id,
@@ -133,12 +139,19 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
         "layers": detection_result["layers"],
         "pipeline_time_ms": detection_result["pipeline_time_ms"],
         "timestamp": detection_result["timestamp"],
+        "agent_state": cb_result["new_status"],
+        "accumulated_risk": cb_result.get("accumulated_risk", 0),
+        "alert_allowed": detection_result.get("alert_allowed", True),
+        "incident_id": detection_result.get("incident_id"),
+        "llm_sampled": detection_result.get("llm_sampled", False),
+        "is_high_privilege": detection_result.get("is_high_privilege", False),
     })
 
     # Broadcast status update
     await ws_manager.broadcast({
         "type": "status_update",
         "statuses": circuit_breaker.get_all_statuses(),
+        "accumulated_risks": circuit_breaker.get_accumulated_risks(),
     })
 
     # Broadcast ledger entry
@@ -155,6 +168,17 @@ async def handle_agent_action(agent_id: str, action: str, action_output: str, tr
             "agent_name": config.name,
             "risk_score": detection_result["final_risk_score"],
             "details": cb_result.get("details", {}),
+            "timestamp": time.time(),
+        })
+
+    # If watchlist was triggered, broadcast alert
+    if cb_result["action_taken"] == "flag_watchlist":
+        await ws_manager.broadcast({
+            "type": "watchlist_alert",
+            "agent_id": agent_id,
+            "agent_name": config.name,
+            "risk_score": detection_result["final_risk_score"],
+            "accumulated_risk": cb_result.get("accumulated_risk", 0),
             "timestamp": time.time(),
         })
 
@@ -189,6 +213,7 @@ async def lifespan(app: FastAPI):
             "content": msg.content[:120],
             "delivered": msg.delivered,
             "timestamp": msg.timestamp,
+            "signature_valid": getattr(msg, 'signature_valid', True),
         }))
 
     def on_drop(msg):
@@ -200,6 +225,7 @@ async def lifespan(app: FastAPI):
             "content": msg.content[:120],
             "drop_reason": msg.drop_reason,
             "timestamp": msg.timestamp,
+            "signature_valid": getattr(msg, 'signature_valid', True),
         }))
 
     message_bus.on_message(on_msg)
@@ -215,9 +241,9 @@ async def lifespan(app: FastAPI):
 
     chaos_monkey.on_attack(on_chaos_attack)
 
-    # Start agent loops
+    # Start agent loops (includes key generation for message bus auth)
     await agent_simulator.start_all()
-    print("[Guardian] Agents started")
+    print("[Guardian] Agents started (with HMAC authentication keys)")
 
     # Start chaos monkey (random attacks)
     await chaos_monkey.start()
@@ -236,7 +262,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Guardian",
     description="Runtime Security Monitoring for Multi-Agent AI Systems",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -270,15 +296,20 @@ async def get_agents():
     """Get info about all agents."""
     agent_info = agent_simulator.get_agent_info()
     statuses = circuit_breaker.get_all_statuses()
+    accumulated_risks = circuit_breaker.get_accumulated_risks()
     for agent_id in agent_info:
         agent_info[agent_id]["status"] = statuses.get(agent_id, "active")
+        agent_info[agent_id]["accumulated_risk"] = accumulated_risks.get(agent_id, 0)
     return {"agents": agent_info}
 
 
 @app.get("/api/statuses")
 async def get_statuses():
-    """Get current status of all agents."""
-    return {"statuses": circuit_breaker.get_all_statuses()}
+    """Get current status of all agents with tiered state info."""
+    return {
+        "statuses": circuit_breaker.get_all_statuses(),
+        "accumulated_risks": circuit_breaker.get_accumulated_risks(),
+    }
 
 
 @app.get("/api/ledger")
@@ -310,6 +341,30 @@ async def get_embedding_visualization():
 async def get_messages(limit: int = 30):
     """Get recent inter-agent messages."""
     return {"messages": message_bus.get_recent(limit)}
+
+
+@app.get("/api/incidents")
+async def get_incidents():
+    """Get active incidents from alert deduplication."""
+    return {"incidents": alert_deduplicator.get_active_incidents()}
+
+
+@app.get("/api/config")
+async def get_config():
+    """Get current system configuration including weights and thresholds."""
+    return {
+        "layer_weights": LAYER_WEIGHTS,
+        "canary_shapes": {k: v["description"] for k, v in CANARY_SHAPES.items()},
+        "features": {
+            "tiered_states": True,
+            "risk_decay": True,
+            "weighted_scoring": True,
+            "multiple_canary_shapes": True,
+            "message_bus_auth": True,
+            "alert_deduplication": True,
+            "probabilistic_llm_sampling": True,
+        },
+    }
 
 
 @app.post("/api/attack/trigger")
@@ -350,7 +405,7 @@ async def stop_attack(agent_id: str = None):
 
 @app.post("/api/agent/{agent_id}/release")
 async def release_agent(agent_id: str):
-    """Release an agent from quarantine."""
+    """Release an agent from quarantine (resets accumulated risk)."""
     circuit_breaker.release_quarantine(agent_id)
     agent_simulator.stop_attack(agent_id)
     taint_tracker.reset_agent(agent_id)
@@ -358,6 +413,7 @@ async def release_agent(agent_id: str):
     await ws_manager.broadcast({
         "type": "status_update",
         "statuses": circuit_breaker.get_all_statuses(),
+        "accumulated_risks": circuit_breaker.get_accumulated_risks(),
     })
 
     return {"status": "released", "agent_id": agent_id}
@@ -368,10 +424,21 @@ async def health_check():
     return {
         "status": "healthy",
         "system": "Guardian",
+        "version": "3.0.0",
         "agents_running": len(agent_simulator._tasks),
         "websocket_connections": len(ws_manager.active_connections),
         "ledger_entries": ledger.length,
         "active_attacks": agent_simulator.get_attack_targets(),
+        "active_incidents": len(alert_deduplicator.get_active_incidents()),
+        "features": [
+            "tiered_states",
+            "risk_decay",
+            "weighted_scoring",
+            "multiple_canary_shapes",
+            "message_bus_auth",
+            "alert_deduplication",
+            "probabilistic_llm_sampling",
+        ],
     }
 
 

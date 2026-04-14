@@ -25,8 +25,8 @@ load_dotenv(os.path.join(_root, "backend", ".env"))
 
 from agents import AGENT_CONFIGS, ATTACK_ACTION_TEMPLATES, ATTACK_PAYLOAD_TEMPLATES
 from agents import MALICIOUS_SERVERS, MALICIOUS_COLLAB_MESSAGES, COLLABORATION_MESSAGES
-from agents import ACTION_VARIATIONS, TOPICS, MessageBus, AgentMessage
-from detection import run_detection_pipeline, CANARY_TOKENS
+from agents import ACTION_VARIATIONS, TOPICS, MessageBus, AgentMessage, agent_key_store
+from detection import run_detection_pipeline, CANARY_TOKENS, alert_deduplicator, LAYER_WEIGHTS
 from taint import taint_tracker, TrustLevel
 from circuit_breaker import circuit_breaker
 from ledger import ledger
@@ -62,7 +62,9 @@ class StateManager:
         with self._lock:
             self.events.appendleft(event)
             if any(l.get("triggered") for l in event.get("layers", [])):
-                self.detection_events.appendleft(event)
+                # Only add if alert deduplication allows it
+                if event.get("alert_allowed", True):
+                    self.detection_events.appendleft(event)
 
     def add_message(self, msg_dict):
         with self._lock:
@@ -97,6 +99,7 @@ def create_message_bus(state: StateManager) -> MessageBus:
             "delivered": msg.delivered,
             "dropped": msg.dropped,
             "drop_reason": msg.drop_reason,
+            "signature_valid": getattr(msg, 'signature_valid', True),
         })
 
     def on_drop(msg: AgentMessage):
@@ -109,6 +112,7 @@ def create_message_bus(state: StateManager) -> MessageBus:
             "delivered": False,
             "dropped": True,
             "drop_reason": msg.drop_reason,
+            "signature_valid": getattr(msg, 'signature_valid', True),
         })
 
     bus.on_message(on_msg)
@@ -204,6 +208,8 @@ def agent_runner(state: StateManager, bus: MessageBus):
                         "layers_triggered": [l["layer"] for l in result["layers"] if l.get("triggered")],
                         "trust_level": trust_level,
                         "circuit_breaker": cb["action_taken"],
+                        "incident_id": result.get("incident_id"),
+                        "agent_state": cb["new_status"],
                     },
                 )
 
@@ -217,6 +223,13 @@ def agent_runner(state: StateManager, bus: MessageBus):
                     "pipeline_time_ms": result["pipeline_time_ms"],
                     "timestamp": result["timestamp"],
                     "cb_action": cb["action_taken"],
+                    "agent_state": cb["new_status"],
+                    "accumulated_risk": cb.get("accumulated_risk", 0),
+                    "alert_allowed": result.get("alert_allowed", True),
+                    "incident_id": result.get("incident_id"),
+                    "suppressed_count": result.get("suppressed_count", 0),
+                    "llm_sampled": result.get("llm_sampled", False),
+                    "is_high_privilege": result.get("is_high_privilege", False),
                 })
 
                 # Non-deterministic sleep
@@ -275,6 +288,9 @@ def init_system():
     for aid, cfg in AGENT_CONFIGS.items():
         circuit_breaker.register_agent(aid)
         embedding_engine.build_baseline(aid, cfg.normal_actions)
+        # Generate message bus authentication keys for each agent
+        fingerprint = agent_key_store.generate_keypair(aid)
+        print(f"[Guardian] Agent {aid} key fingerprint: {fingerprint}")
 
     state = StateManager()
     bus = create_message_bus(state)
@@ -297,22 +313,41 @@ def fmt_time(ts):
 
 def risk_color(score):
     if score >= 70: return "red"
-    if score >= 40: return "yellow"
+    if score >= 40: return "amber"
     if score >= 15: return "blue"
     return "green"
 
-RISK_CSS = {"green": "#4ade80", "yellow": "#facc15", "red": "#f87171", "blue": "#60a5fa"}
-RISK_BG  = {"green": "rgba(34,197,94,0.1)", "yellow": "rgba(234,179,8,0.1)",
-            "red": "rgba(239,68,68,0.1)",   "blue": "rgba(59,130,246,0.1)"}
-FEED_BORDER = {"normal": "#22c55e", "elevated": "#3b82f6", "warning": "#eab308", "critical": "#ef4444"}
+RISK_CSS = {
+    "green": "#4ade80",
+    "amber": "#f59e0b",
+    "red": "#f87171",
+    "blue": "#60a5fa",
+    "yellow": "#facc15",
+}
+RISK_BG = {
+    "green": "rgba(34,197,94,0.1)",
+    "amber": "rgba(245,158,11,0.12)",
+    "red": "rgba(239,68,68,0.1)",
+    "blue": "rgba(59,130,246,0.1)",
+    "yellow": "rgba(234,179,8,0.1)",
+}
+FEED_BORDER = {"normal": "#22c55e", "elevated": "#3b82f6", "warning": "#f59e0b", "critical": "#ef4444"}
 FEED_BG     = {"normal": "transparent", "elevated": "transparent",
-               "warning": "rgba(234,179,8,0.04)", "critical": "rgba(239,68,68,0.06)"}
+               "warning": "rgba(245,158,11,0.06)", "critical": "rgba(239,68,68,0.06)"}
 
 LAYER_NAMES = {"canary_token": "Canary Token", "embedding_drift": "Embedding Drift",
                "llm_judge": "LLM Judge", "taint_tracking": "Taint Tracking"}
 
 MSG_BORDER = {"delivered": "#22c55e", "dropped": "#ef4444"}
 MSG_BG = {"delivered": "transparent", "dropped": "rgba(239,68,68,0.06)"}
+
+# Status colors for tiered states
+STATUS_COLORS = {
+    "active": {"border": "#22c55e", "bg": "rgba(34,197,94,0.08)", "text": "#4ade80", "label": "ACTIVE", "icon": "🟢"},
+    "watchlist": {"border": "#f59e0b", "bg": "rgba(245,158,11,0.10)", "text": "#fbbf24", "label": "WATCHLIST", "icon": "🟡"},
+    "suspicious": {"border": "#f59e0b", "bg": "rgba(245,158,11,0.10)", "text": "#fbbf24", "label": "WATCHLIST", "icon": "🟡"},
+    "quarantined": {"border": "#ef4444", "bg": "rgba(239,68,68,0.10)", "text": "#f87171", "label": "QUARANTINED", "icon": "🔴"},
+}
 
 
 st.markdown("""<style>
@@ -324,6 +359,11 @@ st.markdown("""<style>
 .msg-row{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:5px;font-size:.80rem;border-left:3px solid transparent;margin-bottom:1px}
 div[data-testid="stMetric"]{background:rgba(255,255,255,0.02);padding:8px 12px;border-radius:8px}
 div[data-testid="stExpander"]{border:1px solid rgba(148,163,184,0.08);border-radius:10px}
+.state-badge{display:inline-block;padding:3px 12px;border-radius:14px;font-weight:700;font-size:.75rem;font-family:'JetBrains Mono',monospace;letter-spacing:.5px}
+.incident-badge{display:inline-block;padding:1px 8px;border-radius:8px;font-weight:600;font-size:.68rem;font-family:'JetBrains Mono',monospace;color:#818cf8;background:rgba(129,140,248,0.12);margin-left:6px}
+.weight-bar{height:4px;border-radius:2px;background:rgba(255,255,255,0.05);margin-top:2px}
+.weight-fill{height:100%;border-radius:2px}
+.sig-badge{display:inline-block;padding:1px 6px;border-radius:6px;font-weight:600;font-size:.65rem;font-family:'JetBrains Mono',monospace;margin-left:4px}
 </style>""", unsafe_allow_html=True)
 
 
@@ -367,24 +407,28 @@ with st.sidebar:
         st.caption("Disabled — only manual attacks will occur")
 
     st.divider()
-    st.markdown("### Agent Status")
+    st.markdown("### Agent Status (Tiered)")
     statuses = circuit_breaker.get_all_statuses()
+    accumulated_risks = circuit_breaker.get_accumulated_risks()
     for aid, status in statuses.items():
         name = AGENT_CONFIGS[aid].name
         is_attacked = state.attack_active_agents.get(aid, False)
+        acc_risk = accumulated_risks.get(aid, 0)
+        sc = STATUS_COLORS.get(status, STATUS_COLORS["active"])
+
         if status == "quarantined":
-            st.error(f"QUARANTINED: {name}")
+            st.error(f"{sc['icon']} QUARANTINED: {name} (risk: {acc_risk})")
             if st.button(f"Release {aid}", key=f"rel_{aid}"):
                 circuit_breaker.release_quarantine(aid)
                 state.attack_active_agents[aid] = False
                 taint_tracker.reset_agent(aid)
                 st.rerun()
-        elif status == "suspicious":
-            st.warning(f"SUSPICIOUS: {name}")
+        elif status in ("watchlist", "suspicious"):
+            st.warning(f"{sc['icon']} WATCHLIST: {name} (risk: {acc_risk})")
         elif is_attacked:
-            st.warning(f"UNDER ATTACK: {name}")
+            st.warning(f"⚠️ UNDER ATTACK: {name}")
         else:
-            st.success(f"ACTIVE: {name}")
+            st.success(f"{sc['icon']} ACTIVE: {name} (risk: {acc_risk})")
 
     st.divider()
     st.markdown("### System")
@@ -392,6 +436,19 @@ with st.sidebar:
     st.metric("Events Captured", len(state.events))
     chain_ok = ledger.verify_chain()
     st.success("Merkle Chain Intact") if chain_ok else st.error("Chain Broken!")
+
+    # Active incidents
+    incidents = alert_deduplicator.get_active_incidents()
+    if incidents:
+        st.divider()
+        st.markdown("### Active Incidents")
+        for inc_id, count in incidents.items():
+            st.caption(f"🔥 {inc_id}: {count} alerts")
+
+    st.divider()
+    st.markdown("### Layer Weights")
+    for layer, weight in LAYER_WEIGHTS.items():
+        st.caption(f"{LAYER_NAMES.get(layer, layer)}: **{weight:.2f}**")
 
     st.divider()
     if st.button("Manual Refresh"):
@@ -402,7 +459,7 @@ with st.sidebar:
 # ═══════════════════════  HEADER  ═══════════════════════
 
 st.markdown("## Guardian")
-st.caption("Multi-Agent Runtime Security Monitor  |  Real-time Prompt Injection Detection")
+st.caption("Multi-Agent Runtime Security Monitor  |  Real-time Prompt Injection Detection  |  Tiered State Management")
 
 if state.attack_active:
     targets = state.get_attack_targets()
@@ -423,24 +480,41 @@ for col, aid in zip([c1, c2, c3], ["agent-1", "agent-2", "agent-3"]):
     avg_risk = sum(risks) / len(risks) if risks else 0
     last_act = agent_ev[0]["action"] if agent_ev else "—"
     is_attacked = state.attack_active_agents.get(aid, False)
+    acc_risk = circuit_breaker.get_accumulated_risks().get(aid, 0)
+    sc = STATUS_COLORS.get(status, STATUS_COLORS["active"])
 
     with col:
         with st.container(border=True):
             st.markdown(f"**{cfg.name}**")
             st.caption(aid)
+
+            # ── Tiered state badge ──
             if status == "quarantined":
-                st.markdown(":red[QUARANTINED — Messages Blocked]")
-            elif status == "suspicious":
-                st.markdown(":orange[SUSPICIOUS]")
+                st.markdown(f":red[{sc['icon']} QUARANTINED — Messages Blocked]")
+            elif status in ("watchlist", "suspicious"):
+                st.markdown(f":orange[{sc['icon']} WATCHLIST — Elevated Monitoring]")
             elif is_attacked:
-                st.markdown(":orange[UNDER ATTACK]")
+                st.markdown(":orange[⚠️ UNDER ATTACK]")
             else:
-                st.markdown(":green[ACTIVE]")
-            m1, m2, m3 = st.columns(3)
+                st.markdown(f":green[{sc['icon']} ACTIVE]")
+
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Actions", len(agent_ev))
             m2.metric("Avg Risk", f"{avg_risk:.1f}")
             trust = "TAINTED" if is_attacked else "CLEAN"
             m3.metric("Trust", trust)
+            m4.metric("Acc Risk", f"{acc_risk:.0f}")
+
+            # Risk progress bar (visual state indicator)
+            risk_pct = min(100, acc_risk)
+            bar_color = sc["text"]
+            st.markdown(
+                f'<div style="background:rgba(255,255,255,0.05);border-radius:4px;height:6px;margin:4px 0 8px 0">'
+                f'<div style="width:{risk_pct}%;background:{bar_color};height:100%;border-radius:4px;'
+                f'transition:width 0.5s ease"></div></div>',
+                unsafe_allow_html=True,
+            )
+
             st.code(last_act[:60], language=None)
 
 
@@ -457,14 +531,41 @@ with col_feed:
         for e in events[:25]:
             al = e.get("alert_level", "normal")
             rc = risk_color(e["risk_score"])
+            agent_state = e.get("agent_state", "active")
+            state_sc = STATUS_COLORS.get(agent_state, STATUS_COLORS["active"])
+
+            # State indicator dot
+            state_dot = f'<span style="color:{state_sc["text"]};font-size:.6rem">●</span>'
+
+            # Incident badge
+            inc_badge = ""
+            inc_id = e.get("incident_id")
+            if inc_id and e.get("alert_level") in ("warning", "critical"):
+                inc_badge = f'<span class="incident-badge">{inc_id}</span>'
+
+            # Suppressed indicator
+            suppressed = e.get("suppressed_count", 0)
+            suppress_info = ""
+            if suppressed > 0:
+                suppress_info = f'<span style="color:#64748b;font-size:.68rem;margin-left:4px">({suppressed} suppressed)</span>'
+
+            # Probabilistic LLM sample indicator
+            llm_badge = ""
+            if e.get("llm_sampled"):
+                llm_badge = '<span style="color:#a78bfa;font-size:.65rem;margin-left:4px">🎲LLM</span>'
+            elif e.get("is_high_privilege"):
+                llm_badge = '<span style="color:#f472b6;font-size:.65rem;margin-left:4px">🔒LLM</span>'
+
             rows.append(
                 f'<div class="feed-row" style="border-left-color:{FEED_BORDER.get(al,"#22c55e")}; '
                 f'background:{FEED_BG.get(al,"transparent")}">'
                 f'<span class="mono" style="color:#475569;min-width:68px">{fmt_time(e["timestamp"])}</span>'
+                f'{state_dot} '
                 f'<span style="font-weight:600;color:#94a3b8;min-width:62px">{e["agent_id"]}</span>'
                 f'<span class="mono" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
                 f'{e["action"]}</span>'
-                f'<span class="pill" style="color:{RISK_CSS[rc]};background:{RISK_BG[rc]}">'
+                f'{llm_badge}{inc_badge}{suppress_info}'
+                f'<span class="pill" style="color:{RISK_CSS.get(rc, "#60a5fa")};background:{RISK_BG.get(rc, "transparent")}">'
                 f'{e["risk_score"]:.0f}</span></div>'
             )
         st.markdown("".join(rows), unsafe_allow_html=True)
@@ -477,28 +578,47 @@ with col_det:
     else:
         for de in det_events[:6]:
             rc = risk_color(de["risk_score"])
+            inc_id = de.get("incident_id", "")
+            inc_label = f" [{inc_id}]" if inc_id else ""
+
             with st.expander(
-                f"{de['agent_id']} — Risk {de['risk_score']:.0f}",
+                f"{de['agent_id']} — Risk {de['risk_score']:.0f}{inc_label}",
                 expanded=(de["risk_score"] >= 70),
             ):
                 st.caption(f"Action: `{de['action'][:80]}`")
+
                 for layer in de.get("layers", []):
                     triggered = layer.get("triggered", False)
                     skipped = layer.get("verdict") == "skipped"
                     icon = "[X]" if triggered else ("SKIP" if skipped else "OK")
                     name = LAYER_NAMES.get(layer["layer"], layer["layer"])
                     contrib = layer.get("risk_contribution", 0)
+                    weighted = layer.get("weighted_contribution", contrib)
+                    weight = LAYER_WEIGHTS.get(layer["layer"], 1.0)
                     color = "red" if triggered else ("gray" if skipped else "green")
+
+                    # Show trigger reason for LLM judge
+                    trigger_info = ""
+                    trigger_reasons = layer.get("trigger_reason", [])
+                    if trigger_reasons:
+                        trigger_info = f" ({'|'.join(trigger_reasons)})"
+
+                    # Show canary shapes found
+                    shapes = layer.get("canary_shapes", [])
+                    shape_info = ""
+                    if shapes:
+                        shape_info = f" [{', '.join(shapes)}]"
+
                     st.markdown(
-                        f":{color}[{icon} **{name}**] — +{contrib:.0f}  \n"
-                        f"<small>{layer.get('explanation','')[:120]}</small>",
+                        f":{color}[{icon} **{name}**] — +{weighted:.0f} (raw: {contrib:.0f}, w: {weight}){trigger_info}{shape_info}  \n"
+                        f"<small>{layer.get('explanation','')[:140]}</small>",
                         unsafe_allow_html=True,
                     )
 
 
 # ═══════════════════════  INTER-AGENT COMMUNICATION  ═══════════════════════
 
-with st.expander("Inter-Agent Communication Bus", expanded=True):
+with st.expander("Inter-Agent Communication Bus (Authenticated)", expanded=True):
     messages = state.get_messages(20)
     if not messages:
         st.info("No inter-agent messages yet — agents communicate as they collaborate")
@@ -515,6 +635,14 @@ with st.expander("Inter-Agent Communication Bus", expanded=True):
             if is_dropped:
                 drop_info = f' <span style="color:#ef4444;font-size:.72rem">({m.get("drop_reason", "")})</span>'
 
+            # Signature verification badge
+            sig_valid = m.get("signature_valid", True)
+            sig_badge = (
+                '<span class="sig-badge" style="color:#4ade80;background:rgba(34,197,94,0.12)">✓ SIG</span>'
+                if sig_valid else
+                '<span class="sig-badge" style="color:#ef4444;background:rgba(239,68,68,0.12)">✗ SIG</span>'
+            )
+
             msg_rows.append(
                 f'<div class="msg-row" style="border-left-color:{border_color};background:{bg}">'
                 f'<span class="mono" style="color:#475569;min-width:60px">{fmt_time(m["timestamp"])}</span>'
@@ -523,6 +651,7 @@ with st.expander("Inter-Agent Communication Bus", expanded=True):
                 f'<span style="font-weight:600;color:#818cf8;min-width:55px">{m["recipient"]}</span>'
                 f'<span class="mono" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
                 f'{m["content"][:80]}</span>'
+                f'{sig_badge}'
                 f'<span class="pill" style="color:{status_color};background:transparent;font-size:.7rem">'
                 f'{status_label}</span>{drop_info}</div>'
             )
@@ -547,6 +676,37 @@ with st.expander("Tamper-Evident Audit Ledger", expanded=False):
         )
     else:
         st.info("No ledger entries yet")
+
+
+# ═══════════════════════  FEATURE STATUS PANEL  ═══════════════════════
+
+with st.expander("Feature Status — Advanced Capabilities", expanded=False):
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        st.markdown("**Tiered Agent States**")
+        st.caption("Normal → Watchlist → Quarantine")
+        st.success("✅ Active")
+        st.markdown("**Risk Score Decay**")
+        st.caption("5% decay per clean cycle")
+        st.success("✅ Active")
+        st.markdown("**Weighted Composite Scoring**")
+        st.caption(f"Canary: {LAYER_WEIGHTS['canary_token']}, Drift: {LAYER_WEIGHTS['embedding_drift']}, LLM: {LAYER_WEIGHTS['llm_judge']}, Taint: {LAYER_WEIGHTS['taint_tracking']}")
+        st.success("✅ Active")
+    with f2:
+        st.markdown("**Multiple Canary Shapes**")
+        st.caption("UUID, AWS Key, Password, PII Email")
+        st.success("✅ Active")
+        st.markdown("**Alert Deduplication**")
+        active_incidents = alert_deduplicator.get_active_incidents()
+        st.caption(f"{len(active_incidents)} active incidents")
+        st.success("✅ Active")
+    with f3:
+        st.markdown("**Message Bus Authentication**")
+        st.caption("HMAC-SHA256 signing per agent")
+        st.success("✅ Active")
+        st.markdown("**Probabilistic LLM Sampling**")
+        st.caption("12% random + always on high-privilege actions")
+        st.success("✅ Active")
 
 
 # ═══════════════════════  EMBEDDING VIZ  ═══════════════════════

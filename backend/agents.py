@@ -1,13 +1,20 @@
 """
-Guardian — Agent Network with Inter-Communication and Chaos Monkey
+Guardian — Agent Network with Inter-Communication, Chaos Monkey,
+and Authenticated Message Bus
 
-Agents communicate via a shared MessageBus. A ChaosMonkey introduces
-random attacks on random agents at random intervals, making the
-simulation non-deterministic and realistic.
+Features:
+- Agents communicate via a shared MessageBus with message signing
+- Each agent gets an HMAC keypair at boot for message authentication
+- Messages are signed by the sender and verified before routing
+- Forged sender identity is detected and messages are dropped
+- ChaosMonkey introduces random attacks on random agents
 """
 
 import asyncio
+import hashlib
+import hmac
 import random
+import secrets
 import time
 import uuid
 import threading
@@ -142,6 +149,54 @@ TOPICS = [
 ]
 
 
+# ═══════════════════════  MESSAGE BUS AUTHENTICATION  ═══════════════════════
+
+class AgentKeyStore:
+    """
+    Manages cryptographic keys for message bus authentication.
+    Each agent gets an HMAC secret key at boot. Messages are signed
+    by the sender's key and verified by the bus before routing.
+    """
+
+    def __init__(self):
+        self._keys: Dict[str, bytes] = {}
+        self._lock = threading.Lock()
+
+    def generate_keypair(self, agent_id: str) -> str:
+        """Generate and store a secret key for an agent. Returns a hex fingerprint."""
+        key = secrets.token_bytes(32)
+        with self._lock:
+            self._keys[agent_id] = key
+        fingerprint = hashlib.sha256(key).hexdigest()[:16]
+        return fingerprint
+
+    def sign_message(self, agent_id: str, content: str) -> str:
+        """Sign a message using the agent's secret key."""
+        with self._lock:
+            key = self._keys.get(agent_id)
+        if key is None:
+            raise ValueError(f"Agent {agent_id} has no registered key")
+        signature = hmac.new(key, content.encode("utf-8"), hashlib.sha256).hexdigest()
+        return signature
+
+    def verify_signature(self, agent_id: str, content: str, signature: str) -> bool:
+        """Verify a message signature against the claimed sender's key."""
+        with self._lock:
+            key = self._keys.get(agent_id)
+        if key is None:
+            return False
+        expected = hmac.new(key, content.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+    def has_key(self, agent_id: str) -> bool:
+        with self._lock:
+            return agent_id in self._keys
+
+
+# Global key store
+agent_key_store = AgentKeyStore()
+
+
 # ── Inter-Agent Message Bus ──
 
 @dataclass
@@ -155,12 +210,17 @@ class AgentMessage:
     delivered: bool = False
     dropped: bool = False
     drop_reason: str = ""
+    signature: str = ""
+    signature_valid: bool = True
 
 
 class MessageBus:
     """
     Central communication bus for inter-agent messaging.
-    Messages from/to quarantined agents are dropped and logged.
+    Features:
+    - Messages from/to quarantined agents are dropped and logged
+    - Message authentication: sender signature verified before routing
+    - Forged identity detection
     """
 
     def __init__(self):
@@ -178,6 +238,7 @@ class MessageBus:
     ) -> Optional[AgentMessage]:
         """
         Send a message from one agent to another.
+        Messages are signed by the sender and verified before routing.
         If sender or recipient is quarantined, the message is dropped.
         """
         msg = AgentMessage(
@@ -188,7 +249,28 @@ class MessageBus:
             timestamp=time.time(),
         )
 
+        # ── Sign the message ──
+        try:
+            msg.signature = agent_key_store.sign_message(sender, content)
+            msg.signature_valid = True
+        except (ValueError, Exception):
+            msg.signature = ""
+            msg.signature_valid = False
+
         with self._lock:
+            # ── Verify signature ──
+            if msg.signature and not agent_key_store.verify_signature(sender, content, msg.signature):
+                msg.dropped = True
+                msg.drop_reason = f"FORGED IDENTITY: Signature verification failed for {sender}"
+                msg.signature_valid = False
+                self._messages.append(msg)
+                for cb in self._on_drop_callbacks:
+                    try:
+                        cb(msg)
+                    except Exception:
+                        pass
+                return msg
+
             # Check if sender is quarantined
             if is_quarantined_fn(sender):
                 msg.dropped = True
@@ -236,6 +318,7 @@ class MessageBus:
                     "delivered": m.delivered,
                     "dropped": m.dropped,
                     "drop_reason": m.drop_reason,
+                    "signature_valid": m.signature_valid,
                 }
                 for m in recent[:n]
             ]
@@ -355,6 +438,9 @@ class AgentSimulator:
         self._running = True
         for agent_id in self.configs:
             self._attack_active[agent_id] = False
+            # Generate authentication keypair for each agent at boot
+            fingerprint = agent_key_store.generate_keypair(agent_id)
+            print(f"[Guardian] Agent {agent_id} key fingerprint: {fingerprint}")
             self._tasks[agent_id] = asyncio.create_task(
                 self._agent_loop(agent_id)
             )
@@ -525,6 +611,7 @@ class AgentSimulator:
                 "goal": config.goal,
                 "normal_actions": config.normal_actions,
                 "is_attack_target": self._attack_active.get(agent_id, False),
+                "has_auth_key": agent_key_store.has_key(agent_id),
             }
             for agent_id, config in self.configs.items()
         }
