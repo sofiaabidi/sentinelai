@@ -1,4 +1,4 @@
-# SentinelAI 🛡️
+# Gaurdian 🛡️
 
 **Runtime Security Monitoring Dashboard for Multi-Agent AI Systems**
 

@@ -1,6 +1,6 @@
 """
 LLM-as-Judge Module
-Uses Groq API with Llama 3 8B for structured verdict on suspicious actions.
+Uses Groq API with Llama 3.1 8B Instant for structured verdict on suspicious actions.
 Falls back to a rule-based mock if no API key is available.
 """
 
@@ -80,7 +80,7 @@ class LLMJudge:
     def _call_groq(self, prompt: str) -> Dict:
         try:
             response = self._client.chat.completions.create(
-                model="llama3-8b-8192",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": "You are a security analysis AI. Respond only with valid JSON."},
                     {"role": "user", "content": prompt},
@@ -106,7 +106,7 @@ class LLMJudge:
                         "threat_type": "behavioral_drift",
                     }
 
-            verdict["source"] = "groq_llama3_8b"
+            verdict["source"] = "groq_llama3.1_8b_instant"
             verdict["timestamp"] = time.time()
             return verdict
 

@@ -1,11 +1,8 @@
-"""
-SentinelAI — Streamlit Security Dashboard
-Self-contained: runs agent simulation + detection pipeline + UI in one process.
-"""
+
 import streamlit as st
 
 st.set_page_config(
-    page_title="SentinelAI — Security Monitor",
+    page_title="Gaurdian — Security Monitor",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -123,8 +120,6 @@ def agent_runner(state: StateManager):
                 time.sleep(2)
 
 
-# ═══════════════════════  INIT (runs once)  ═══════════════════════
-
 @st.cache_resource
 def init_system():
     for aid, cfg in AGENT_CONFIGS.items():
@@ -138,8 +133,6 @@ def init_system():
 
 state = init_system()
 
-
-# ═══════════════════════  HELPERS  ═══════════════════════
 
 def fmt_time(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
@@ -161,8 +154,6 @@ LAYER_NAMES = {"canary_token": "🪤 Canary Token", "embedding_drift": "📐 Emb
                "llm_judge": "🧠 LLM Judge", "taint_tracking": "🏷️ Taint Tracking"}
 
 
-# ═══════════════════════  CUSTOM CSS  ═══════════════════════
-
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
 .block-container{max-width:1450px}
@@ -174,7 +165,6 @@ div[data-testid="stExpander"]{border:1px solid rgba(148,163,184,0.08);border-rad
 </style>""", unsafe_allow_html=True)
 
 
-# ═══════════════════════  SIDEBAR  ═══════════════════════
 
 with st.sidebar:
     st.markdown("## ⚡ Controls")

@@ -1,0 +1,18 @@
+SentinelAI Backend Pipeline Clarifications
+
+1. Do agents inter-communicate and does that communication stop when one agent goes rogue?
+No, the agents do not actually inter-communicate in the current implementation. The communication is entirely mocked via hardcoded strings (e.g., "draft_message: sending collaboration request") within the `AgentSimulator` in `agents.py`. There is no mechanism passing data between agents. When an agent "goes rogue" and is quarantined by the `circuit_breaker`, its outbound actions are blocked from being processed in the pipeline, and a "quarantine alert" is broadcast via WebSocket. This effectively skips processing its mock actions, but doesn't stop real inter-agent messaging because such messaging doesn't exist.
+
+2. How is the agent accessing the env for the canary token?
+The agent is NOT accessing the environment for the canary token. Even though CANARY_AGENT1, CANARY_AGENT2, etc., are declared in `.env.example`, the backend completely ignores them. `detection.py` uses a hardcoded dictionary (`CANARY_TOKENS`) instead of reading from `.env`. Furthermore, the agents themselves do not seek or read the environment; the tokens are manually hardcoded into the `ATTACK_PAYLOAD` in `agents.py` and are blindly emitted when the attack mode is toggled on via the API.
+
+3 & 4. Evaluate the whole backend pipeline and identify gaps, deterministic logic that wouldn't be realistic, or simulation errors:
+
+A. Synchronous LLM Calls in Async Loop (Simulation Error & Gap):
+In `main.py`, `handle_agent_action` is an asynchronous function (`async def`), but it calls `run_detection_pipeline` which subsequently calls `llm_judge.py`. If a Groq API key is present, `llm_judge.py` uses the synchronous Groq client (`self._client.chat.completions.create`) to make the network request. Executing a blocking/synchronous I/O operation inside an asyncio loop will freeze the entire FastAPI server (including all WebSocket broadcasts and REST endpoints) until the LLM responds. This is a critical simulation error.
+
+B. Static Embeddings from Mock Actions (Unrealistic Deterministic Logic):
+The `EmbeddingEngine` in `embeddings.py` computes the "normal behavior centroid" by embedding the exact same list of 10 hardcoded string actions it uses during the simulation. Since real agents dynamically generate diverse text variations depending on perception and context, the drift calculation here is completely static and artificial. 
+
+C. Fully Orchestrated "Hijack" & Taint (Unrealistic Simulation):
+The agents are never organically hijacked by untrusted input. Instead, the attack is manually toggled by the `/api/attack/trigger` endpoint. The server manually intervenes to configure the agent's taint status to `EXTERNAL_WEB` and explicitly flips a boolean `_attack_active`, forcing the agent to output a predefined malicious hardcoded string (`ATTACK_PAYLOAD`). A real-world pipeline using data-flow analysis to taint variables is absent; the taint status works like a simple manual switch.
